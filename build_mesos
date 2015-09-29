@@ -3,7 +3,9 @@ set -o errexit -o nounset -o pipefail
 export LC_ALL=C
 function -h {
 cat <<USAGE
- USAGE: build_mesos (--repo <git URL>)? (--nominal-version <version>)?
+ USAGE: build_mesos (--repo <git URL>)?
+                    (--nominal-version <version>)?
+                    (--build-version <debian_revision or rpm release>)?
 
   Performs a build in ./mesos-repo after checking out a recent copy of Mesos.
   The default is to checkout:
@@ -14,36 +16,118 @@ cat <<USAGE
   not work to use an \`='; the \`--repo' option must be separated from the Git
   URL with a space.
 
+  Nominal version is the Mesos major.minor.patch version and is autodetected
+  from the repository checkout. The detected version can be overridden with
+  --nominal-version.
+
+  Build version is an additional version string used for package releases. For
+  debian packages this is known as the 'debian revision' and for rpm packages
+  it is known as the 'rpm release version'. By default this is set to a
+  snapshot timestamp schema of the form: 0.1.%Y%m%d%H%M%S. Here are some
+  examples of what this might look like:
+
+    * Snapshot build:                   0.1.20140809173810
+    * Mesos release candidate 1:        0.2.rc1
+    * Mesos release candidate 2:        0.3.rc2
+    * Mesos release:                    1.0
+    * Mesos release with packaging fix: 1.1
+
   The repo can be given as ...?ref=prod7 or even ...?prod7 to select a
   particular branch to build.
+
+  Rather than have this script perform all the build steps, you can point it at
+  all or part of an exsting build and have it go from there. Use \`--src-dir' to
+  specify the code checkout to use. \`--build-dir' to specify where 'make'
+  should be run from. If you have already run built mesos in that directory,
+  then you can use \`--prebuilt' to tell the script to just run make install
+  inside the build directory to make the package.
 
 USAGE
 }; function --help { -h ;}
 
-this="$(cd "$(dirname "$0")" && pwd -P)"
-name=mesos
-version="${version:-9999}"
+function globals {
+  this="$(cd "$(dirname "$0")" && pwd -P)"
+  name=mesos
+  build_version="0.1.$(date -u +'%Y%m%d%H%M%S')"
+  repo=https://git-wip-us.apache.org/repos/asf/mesos.git
+  use_git_version=false
+  prebuilt=false
+  extra_libs=''
+}; globals
+
+function as_absolute {
+  if [[ "$1" == /* ]]; then
+    echo "$1"
+  else
+    echo "$start_dir/$1"
+  fi
+}
 
 function main {
   while [[ $# -gt 0 ]]
   do
     case "$1" in                                      # Munging globals, beware
-      --repo)                   repo="$2"    ; shift 2 ;;
-      --nominal-version)        version="$2" ; shift 2 ;;
+      --src-dir)                src_dir="$2"       ; shift 2 ;;
+      --build-dir)              build_dir="$2"     ; shift 2 ;;
+      --prebuilt)               prebuilt=true      ; shift 1 ;;
+      --repo)                   repo="$2"          ; shift 2 ;;
+      --branch)                 branch="$2"        ; shift 2 ;;
+      --nominal-version)        version="$2"       ; shift 2 ;;
+      --build-version)          build_version="$2" ; shift 2 ;;
+      --extra-libs)             extra_libs="$2"    ; shift 2 ;;
       *)                        err 'Argument error. Please see help.' ;;
     esac
   done
-  checkout go
+
+  : "${src_dir:=mesos-repo}"
+  : "${build_dir:=$src_dir/build}"
+
+  src_dir=$(as_absolute "$src_dir")
+  build_dir=$(as_absolute "$build_dir")
+
+  # Use the more specific dir, e.g. centos/6 will be used over centos if present
+  if [[ -d "$this/$linux" ]]
+  then asset_dir="$linux"
+  elif [[ -d "${linux%%/*}" ]]
+  then asset_dir="${linux%%/*}"
+  else err "Unable to determine asset_dir for $linux"; exit 1
+  fi
+
+  if ! $prebuilt; then
+    checkout
+  fi
+  version=${version:-"$(mesos_version)"}      # Set from checkout if no version
+  ( cd "$src_dir" && go )
 }
 
 function go {
-  build
+  if ! $prebuilt; then
+    build
+  fi
   create_installation
+  create_lib_symlinks
   pkg
   save_python_egg
 }
 
-use_git_version=false
+function mesos_version {
+  local configure_ac="$src_dir"/configure.ac
+  if [[ -f "$configure_ac" ]]
+  then
+    # Error if AC_INIT is not found or extracted version does not match pattern
+    local ac_init=$(grep '^AC_INIT(\[mesos\], \[' "$configure_ac")
+    if [[ ! "$ac_init" =~ .*([0-9]+\.[0-9]+\.[0-9]+).* ]]
+    then
+      err "Unable to extract Mesos version from: ${configure_ac}"
+      exit 1
+    fi
+    out "${BASH_REMATCH[1]}"
+  else
+    err "Unable to find ${configure_ac}; checkout required"
+    exit 1
+  fi
+}
+
 function maybe_append_git_hash {
   if $use_git_version && git rev-parse --git-dir &>/dev/null
   then out "$1-g$(git log -n1 --format=%h)"
@@ -51,7 +135,6 @@ function maybe_append_git_hash {
   fi
 }
 
-repo=https://git-wip-us.apache.org/repos/asf/mesos.git
 function checkout {
   local url=( $(url_split "$repo") )
   local repository="${url[0]}"
@@ -63,21 +146,21 @@ function checkout {
     ref=*|h=*|branch=*|tag=*) local ref="${query#*=}" ;;
     *)                        local ref="$query" ;;
   esac
-  if [[ -d mesos-repo ]]
-  then msg "Found directory \`mesos-repo'; skipping checkout."
-  else msg "Cloning: $repository at $ref" && git clone "$repository" mesos-repo
+  if [[ -d "$src_dir" ]]
+  then msg "Found directory \`$src_dir'; skipping checkout."
+  else msg "Cloning: $repository at $ref" && git clone "$repository" "$src_dir"
   fi
-  ( cd mesos-repo && ( [[ ! ${ref:-} ]] || git checkout -f "$ref" ) && "$@" )
+  ( cd "$src_dir" && ( [[ ! ${ref:-} ]] || git checkout -f "$ref" ) && "$@" )
 }
 
 function build {(
+  export LD_RUN_PATH=/usr/lib/mesos
   autoreconf -f -i -Wall,no-obsolete
   ./bootstrap
-  mkdir -p build
-  cd build
-  ../configure
-  # optimal number of build jobs is 2x num_cores
-  make -j $(($(num_cores)*2))
+  mkdir -p "$build_dir"
+  cd "$build_dir"
+  "$src_dir"/configure $(configure_opts)
+  make
 )}
 
 function os_release {
@@ -121,7 +204,7 @@ function os_release {
 function display_version {
   local os="$( tr A-Z a-z <<<"$1" )" version="$( tr A-Z a-z <<<"$2" )"
   case "$os" in
-    redhat|centos|debian) out "$os/${version%%.*}" ;;   # Ignore minor versions
+    redhat|centos|debian|fedora) out "$os/${version%%.*}" ;;   # Ignore minor versions
     macosx)               out "$os/${version%.*}" ;;  # Ignore bug fix releases
     *)                    out "$os/$version" ;;
   esac
@@ -130,46 +213,84 @@ function display_version {
 function create_installation {(
   local pwd="$(pwd -P)"
   mkdir -p toor
-  ( cd build && make install DESTDIR="$pwd"/toor )
+  ( cd "$build_dir" && make install DESTDIR="$pwd"/toor )
   cd toor
   mkdir -p usr/share/doc/mesos etc/default etc/mesos var/log/mesos
-  cp ../CHANGELOG               usr/share/doc/mesos/
-  cp "$this"/default/mesos*     etc/default/
+  mkdir -p etc/mesos-master etc/mesos-slave var/lib/mesos
+  cp ../CHANGELOG                usr/share/doc/mesos/
+  cp "$this"/default/mesos*      etc/default/
   echo zk://localhost:2181/mesos > etc/mesos/zk
+  if [[ $(vercomp "$version" 0.19.0) == '>' ]] ||
+     [[ $(vercomp "$version" 0.19.0) == '=' ]]
+  then
+    echo /var/lib/mesos          > etc/mesos-master/work_dir
+    echo 1                       > etc/mesos-master/quorum
+  fi
+  extra_libs
   init_scripts "$linux"
   jars
-  chown -R 0:0 .
+)}
+
+function create_lib_symlinks {(
+  cd toor
+  if [[ ! -d usr/local/lib ]]
+  then
+    msg "Create symlinks for backwards compatibility (e.g. Marathon currently"
+    msg "expects libmesos.so to exist in /usr/local/lib)."
+    mkdir -p usr/local/lib
+    # ensure symlinks are relative so they work as expected in the final env
+    ( cd usr/local/lib && cp -s ../../lib/lib*.so . )
+  fi
 )}
 
 function init_scripts {
   mkdir -p usr/bin
   cp -p "$this"/mesos-init-wrapper usr/bin
   case "$1" in
+    fedora/*|redhat/7|redhat/7.*|centos/7|centos/7.*)
+      mkdir -p usr/lib/systemd/system
+      cp "$this"/systemd/master.systemd usr/lib/systemd/system/mesos-master.service
+      cp "$this"/systemd/slave.systemd usr/lib/systemd/system/mesos-slave.service ;;
+    debian/8*|ubuntu/15*)
+      mkdir -p lib/systemd/system
+      cp "$this"/systemd/master.systemd lib/systemd/system/mesos-master.service
+      cp "$this"/systemd/slave.systemd lib/systemd/system/mesos-slave.service ;;
     debian/*)
       mkdir -p etc/init.d
-      cp -p "$this"/debian/master.init etc/init.d/mesos-master
-      cp -p "$this"/debian/slave.init etc/init.d/mesos-slave ;;
-    ubuntu/*)
+      cp -p "$this"/init/master.init etc/init.d/mesos-master
+      cp -p "$this"/init/slave.init etc/init.d/mesos-slave ;;
+    ubuntu/*|redhat/6|redhat/6.*|centos/6|centos/6.*)
       mkdir -p etc/init
-      cp "$this"/ubuntu/master.upstart etc/init/mesos-master.conf
-      cp "$this"/ubuntu/slave.upstart etc/init/mesos-slave.conf ;;
-    redhat/6|redhat/6.*|centos/6|centos/6.*)
-      mkdir -p etc/init
-      cp "$this"/ubuntu/master.upstart etc/init/mesos-master.conf
-      cp "$this"/ubuntu/slave.upstart etc/init/mesos-slave.conf ;;
+      cp "$this"/upstart/master.upstart etc/init/mesos-master.conf
+      cp "$this"/upstart/slave.upstart etc/init/mesos-slave.conf ;;
     *) err "Not sure how to make init scripts for: $1" ;;
   esac
 }
 
+function extra_libs {
+  if [ -n "$extra_libs" ]
+  then
+    mkdir -p usr/lib/mesos
+    IFS=";"
+    for lib in $extra_libs
+    do
+      cp -f $lib usr/lib/mesos/
+    done
+  fi
+}
+
 function jars {
   mkdir -p usr/share/java/
-  mv ../build/src/mesos-*.jar usr/share/java/
+  if [[ -d "$build_dir"/src/java/target ]]
+  then mv "$build_dir"/src/java/target/mesos-*.jar usr/share/java # Mesos >= 0.18.1
+  else mv "$build_dir"/src/mesos-*.jar usr/share/java             # Mesos <  0.18.1
+  fi
 }
 
 function pkg {
   case "$linux" in
     ubuntu/*|debian/*) deb_ ;;
-    centos/*|redhat/*) rpm_ ;;
+    centos/*|redhat/*|fedora/*) rpm_ ;;
     *)                 err "Not sure how to package for: $linux" ;;
   esac
 }
@@ -177,7 +298,7 @@ function pkg {
 function architecture {
   case "$linux" in
     ubuntu/*|debian/*) dpkg-architecture -qDEB_BUILD_ARCH ;;
-    centos/*|redhat/*) arch ;;
+    centos/*|redhat/*|fedora/*) arch ;;
     *)                 err "Not sure how to determine arch for: $linux" ;;
   esac
 }
@@ -187,24 +308,28 @@ function find_gem_bin {
 }
 
 function deb_ {
-  local scripts="${linux%%/*}"
   local opts=( -t deb
                --deb-recommends zookeeper
                --deb-recommends zookeeperd
                --deb-recommends zookeeper-bin
-               -d 'java7-runtime-headless | java6-runtime-headless'
+               -d 'java-runtime-headless'
                -d libcurl3
-               --after-install "$this/$scripts/mesos.postinst"
-               --after-remove "$this/$scripts/mesos.postrm" )
+               -d libsvn1
+               -d libsasl2-modules
+               --after-install "$this/$asset_dir/mesos.postinst"
+               --after-remove "$this/$asset_dir/mesos.postrm" )
+  rm -f "$this"/pkg.deb
   fpm_ "${opts[@]}" -p "$this"/pkg.deb
 }
 
 function rpm_ {
-  local scripts="${linux%%/*}"
   local opts=( -t rpm
                -d libcurl
-               --after-install "$this/$scripts/mesos.postinst"
-               --after-remove "$this/$scripts/mesos.postrm" )
+               -d subversion
+               -d cyrus-sasl-md5
+               --after-install "$this/$asset_dir/mesos.postinst"
+               --after-remove "$this/$asset_dir/mesos.postrm" )
+  rm -f "$this"/pkg.rpm
   fpm_ "${opts[@]}" -p "$this"/pkg.rpm
 }
 
@@ -220,24 +345,41 @@ function fpm_ {
   local opts=( -s dir
                -n "$name"
                -v "$version"
+               --iteration "$build_version"
                --description
-"Cluster resouce manager with efficient resource isolation
+"Cluster resource manager with efficient resource isolation
 Apache Mesos is a cluster manager that offers efficient resource isolation
 and sharing across distributed applications, or frameworks. It can run
 Hadoop, MPI, Hypertable, Spark (a new framework for low-latency interactive
 and iterative jobs), and other applications."
-               --url=http://incubator.apache.org/mesos/
+               --url=https://mesos.apache.org/
+               --license Apache-2.0
                -a "$arch"
                --category misc
                --vendor ""
-               -m mesos-dev@incubator.apache.org
+               -m dev@mesos.apache.org
+               --config-files etc/
                --prefix=/ )
   ( cd toor && "$gem_bin"/fpm "${opts[@]}" "$@" -- . )
 }
 
 function save_python_egg {
-  local eggs=( build/src/python/dist/*.egg )
-  cat "${eggs[@]}" > "$this"/mesos.egg
+  local python_dist="$build_dir"/src/python/dist
+  if ls -d "$build_dir"/src/python/native/dist/*.egg &>/dev/null
+  then
+    # Eggs were found in the old location, use that instead
+    python_dist="$build_dir"/src/python/native/dist
+  fi
+  local eggs=( "$python_dist"/*.egg )
+  cp "${eggs[@]}" "$this"/
+  if [[ $(vercomp "$version" 0.20.0) == '<' ]]
+  then
+    # Old way to create the distribution egg
+    cat "${eggs[@]}" > "$this"/mesos.egg
+  else
+    # Distribute mesos.native (mesos.interface can be found on pypi)
+    cp "$this"/mesos.native*.egg "$this"/mesos.egg
+  fi
 }
 
 function upload {
@@ -251,6 +393,7 @@ function get_system_info {
   linux="$(os_release)"                 # <distro>/<version>, like ubuntu/12.10
   arch="$(architecture)"          # In the format used to label distro packages
   gem_bin="$(find_gem_bin)"                          # Might not be on the PATH
+  start_dir="$PWD"
 }
 
 function url_fragment {
@@ -271,21 +414,58 @@ function url_split {
   out "$fragment"
 }
 
-# Print the number of cores detected. If we are unable to determine the number
-# of cores, print a warning and assume "1" core.
-function num_cores {
-  local cores=
-  if hash nproc &>/dev/null
-  then cores="$(nproc)"                                   # Linux based systems
-  else                                                            # OSX and BSD
-    if cores="$(sysctl -n hw.ncpu)"
-    then : # Do nothing, success
-    else
-      msg "Could not find nproc and sysctl failed; defaulting to 1 core."
-      cores=1
-    fi
+# Return Mesos configuration options
+function configure_opts {
+  local options="--prefix=/usr"
+  if [[ "$version" == 0.18.0-rc4 ]] || [[ "$repo" =~ 0\.18\.0-rc4$ ]]
+  then options+=" --without-cxx11"                # See: MESOS-750 and MESOS-1095
   fi
-  out "$cores"
+  if [[ $(vercomp "$version" 0.21.0) == '>' ]] ||
+     [[ $(vercomp "$version" 0.21.0) == '=' ]]
+  then options+=" --enable-optimize"
+  fi
+
+  out "$options"
+}
+
+# Compares version strings $1 with $2 and prints '=', '>', or '<'
+# Only works if compared strings have the same number of positions, for example:
+#   vercomp 0.19    0.2   # good
+#   vercomp 0.19.0  0.2.0 # good
+#   vercomp 0.19.0  0.2   # bad
+# Adapted from: http://stackoverflow.com/a/4025065/3389824
+function vercomp {
+  if [[ $1 == $2 ]]
+  then
+    out '='
+    return
+  fi
+  local IFS=.
+  local i ver1=($1) ver2=($2)
+  # fill empty fields in ver1 with zeros
+  for ((i=${#ver1[@]}; i<${#ver2[@]}; i++))
+  do
+    ver1[i]=0
+  done
+  for ((i=0; i<${#ver1[@]}; i++))
+  do
+    if [[ -z ${ver2[i]} ]]
+    then
+      # fill empty fields in ver2 with zeros
+      ver2[i]=0
+    fi
+    if ((10#${ver1[i]} > 10#${ver2[i]}))
+    then
+      out '>'
+      return
+    fi
+    if ((10#${ver1[i]} < 10#${ver2[i]}))
+    then
+      out '<'
+      return
+    fi
+  done
+  out =
 }
 
 function msg { out "$*" >&2 ;}
